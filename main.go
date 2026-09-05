@@ -1,22 +1,26 @@
 // This program finds every product page on the Aquasana water filter
-// category, then visits each product page one at a time and prints
-// whether it loaded successfully. Everything is hard-coded on purpose:
-// there are no command-line flags and no concurrency, so the code runs
-// top to bottom in a single, easy-to-follow order.
+// category, then visits each product page one at a time, finds every
+// PDF linked on that page, and downloads any PDF it has not already
+// saved into a local "PDFs" folder. Everything is hard-coded on
+// purpose: there are no command-line flags and no concurrency, so the
+// code runs top to bottom in a single, easy-to-follow order, and it
+// can be safely re-run — anything already saved on disk is skipped.
 package main // every Go program that runs on its own is package main
 
 // bring in the standard library pieces this program needs
 import (
-	"fmt"      // fmt lets us build formatted error messages
-	"io"       // io lets us read and discard response bodies
-	"log"      // log lets us print timestamped status messages to the screen
-	"net/http" // net/http lets us make web requests
-	"net/url"  // net/url lets us combine and clean up web addresses
-	"regexp"   // regexp lets us search text for patterns
-	"sort"     // sort lets us put the URL list in alphabetical order
-	"strconv"  // strconv lets us turn text numbers into real numbers
-	"strings"  // strings gives us helper functions for text
-	"time"     // time lets us pause between requests and measure how long they take
+	"fmt"           // fmt lets us build formatted error messages
+	"io"            // io lets us read and copy response bodies
+	"log"           // log lets us print timestamped status messages to the screen
+	"net/http"      // net/http lets us make web requests
+	"net/url"       // net/url lets us combine and clean up web addresses
+	"os"            // os lets us create folders and files on disk
+	"path/filepath" // path/filepath lets us build local file paths safely
+	"regexp"        // regexp lets us search text for patterns
+	"sort"          // sort lets us put lists into a predictable order
+	"strconv"       // strconv lets us turn text numbers into real numbers
+	"strings"       // strings gives us helper functions for text
+	"time"          // time lets us pause between requests and measure how long they take
 )
 
 // the web page where product listings start
@@ -40,18 +44,28 @@ const identifyOurselvesAs = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKi
 // a safety limit on how many extra listing pages we will ask for, in case something goes wrong
 const mostPaginationRequestsAllowed = 50
 
+// the name of the local folder where downloaded PDFs are saved
+const pdfsFolderName = "PDFs"
+
 // a pattern that matches a link ending in a product's numeric id, e.g. "...-100236133.html"
 var productLinkPattern = regexp.MustCompile(`href="([^"]+-\d{5,}\.html[^"]*)"`)
 
 // a pattern that finds text like "of 67 Results" so we know how many products exist in total
 var totalResultsPattern = regexp.MustCompile(`of\s+([\d,]+)\s+Results`)
 
+// a pattern that matches any link ending in ".pdf", uppercase or lowercase
+var pdfLinkPattern = regexp.MustCompile(`(?i)href="([^"]+\.pdf)"`)
+
 // oneVisitOutcome holds what happened when we visited a single product page
+// and tried to download whatever PDFs were linked from it
 type oneVisitOutcome struct {
-	webAddress    string        // the product page we visited
-	statusCode    int           // the numeric HTTP status the server sent back, e.g. 200
-	howLongItTook time.Duration // how long the request took
-	problem       error         // set if something went wrong instead of getting a response
+	webAddress        string        // the product page we visited
+	statusCode        int           // the numeric HTTP status the server sent back, e.g. 200
+	howLongItTook     time.Duration // how long the page request took
+	problem           error         // set if something went wrong instead of getting a response
+	pdfsFoundOnPage   int           // how many distinct PDF links were on this page
+	pdfsDownloadedNow int           // how many of those PDFs we actually downloaded this run
+	pdfsAlreadySaved  int           // how many of those PDFs were already on disk from a previous run
 }
 
 // main is where the program starts running
@@ -84,13 +98,19 @@ func main() {
 		log.Println(" ", oneWebAddress) // log it indented under the heading
 	}
 
+	// make sure the local folder for downloaded PDFs exists before we start
+	if err := os.MkdirAll(pdfsFolderName, 0o755); err != nil {
+		log.Printf("Could not create the %s folder: %v", pdfsFolderName, err) // explain why we cannot continue
+		return                                                                // stop the program early
+	}
+
 	// tell the person watching that we are about to visit every page
-	log.Printf("Visiting %d product pages one at a time...", len(productWebAddresses))
+	log.Printf("Visiting %d product pages one at a time to find and download PDFs...", len(productWebAddresses))
 
-	// visit every product page in order and collect what happened at each one
-	visitOutcomes := visitEveryProductPage(webClient, productWebAddresses)
+	// visit every product page in order, download any new PDFs, and collect what happened at each one
+	visitOutcomes := visitEveryProductPageAndDownloadItsPdfs(webClient, productWebAddresses)
 
-	// print a final pass/fail summary
+	// print a final pass/fail summary, including PDF totals
 	printFinalSummary(visitOutcomes)
 }
 
@@ -209,6 +229,30 @@ func addProductLinksFoundOnPage(uniqueProductWebAddresses map[string]struct{}, b
 	}
 }
 
+// findPdfWebAddressesOnPage searches the given page text for PDF links and
+// returns each one, resolved into a full, unique, sorted web address.
+func findPdfWebAddressesOnPage(pageText string, baseWebAddress *url.URL) []string {
+	allMatches := pdfLinkPattern.FindAllStringSubmatch(pageText, -1) // find every PDF link on the page
+	uniquePdfWebAddresses := make(map[string]struct{})               // a set to avoid downloading the same PDF twice from one page
+
+	for _, oneMatch := range allMatches { // loop over each match we found
+		rawLinkText := unescapeHtmlText(oneMatch[1]) // clean up HTML escape codes like &amp;
+		parsedLink, err := url.Parse(rawLinkText)    // parse the link into a structured web address
+		if err != nil {
+			continue // skip this one if it could not be parsed
+		}
+		fullWebAddress := baseWebAddress.ResolveReference(parsedLink) // turn a relative link into a full one
+		uniquePdfWebAddresses[fullWebAddress.String()] = struct{}{}   // add the finished address to the set
+	}
+
+	pdfWebAddresses := make([]string, 0, len(uniquePdfWebAddresses)) // preallocate the right size
+	for oneWebAddress := range uniquePdfWebAddresses {               // loop over every unique PDF address
+		pdfWebAddresses = append(pdfWebAddresses, oneWebAddress) // add it to the list
+	}
+	sort.Strings(pdfWebAddresses) // sort them so the download order is predictable
+	return pdfWebAddresses        // hand back the finished list
+}
+
 // unescapeHtmlText turns common HTML escape codes back into plain characters,
 // for example turning "&amp;" back into "&".
 func unescapeHtmlText(text string) string {
@@ -222,23 +266,26 @@ func unescapeHtmlText(text string) string {
 	return replacer.Replace(text) // apply all the rules and return the result
 }
 
-// visitEveryProductPage visits each product URL, one after another, printing
-// a line for each one as it finishes, and returns what happened at each page.
-func visitEveryProductPage(webClient *http.Client, productWebAddresses []string) []oneVisitOutcome {
+// visitEveryProductPageAndDownloadItsPdfs visits each product URL, one after
+// another, finds and downloads any new PDFs linked from it, logs a line for
+// each page as it finishes, and returns what happened at every page.
+func visitEveryProductPageAndDownloadItsPdfs(webClient *http.Client, productWebAddresses []string) []oneVisitOutcome {
 	// somewhere to collect the outcome of every page we visit
 	allOutcomes := make([]oneVisitOutcome, 0, len(productWebAddresses)) // preallocate the right size
 
 	// go through the product URLs one at a time, in order
 	for _, oneWebAddress := range productWebAddresses {
-		outcome := visitOneProductPage(webClient, oneWebAddress) // visit this single page
+		outcome := visitOneProductPageAndDownloadItsPdfs(webClient, oneWebAddress) // visit this single page and download its PDFs
 
 		resultLabel := "OK" // assume success unless we learn otherwise
 		if outcome.problem != nil || outcome.statusCode >= 400 {
 			resultLabel = "FAIL" // mark it as a failure if there was an error or a bad status code
 		}
 
-		// log one line describing what happened at this page
-		log.Printf("[%-4s] %-3d %8s  %s", resultLabel, outcome.statusCode, outcome.howLongItTook.Round(time.Millisecond), outcome.webAddress)
+		// log one line describing what happened at this page, including the PDF counts
+		log.Printf("[%-4s] %-3d %8s  %s  (pdfs: %d found, %d downloaded, %d already saved)",
+			resultLabel, outcome.statusCode, outcome.howLongItTook.Round(time.Millisecond), outcome.webAddress,
+			outcome.pdfsFoundOnPage, outcome.pdfsDownloadedNow, outcome.pdfsAlreadySaved)
 
 		allOutcomes = append(allOutcomes, outcome) // remember this outcome for the final summary
 
@@ -248,43 +295,143 @@ func visitEveryProductPage(webClient *http.Client, productWebAddresses []string)
 	return allOutcomes // hand back every outcome we recorded
 }
 
-// visitOneProductPage sends a single GET request to the given web address
-// and reports back the status code and how long it took.
-func visitOneProductPage(webClient *http.Client, webAddress string) oneVisitOutcome {
-	request, err := http.NewRequest(http.MethodGet, webAddress, nil) // build the outgoing request
+// visitOneProductPageAndDownloadItsPdfs downloads a single product page,
+// finds every PDF linked on it, downloads any that are not already saved,
+// and reports back what happened.
+func visitOneProductPageAndDownloadItsPdfs(webClient *http.Client, productWebAddress string) oneVisitOutcome {
+	// start building the outcome we will return, with the web address already filled in
+	outcome := oneVisitOutcome{webAddress: productWebAddress}
+
+	request, err := http.NewRequest(http.MethodGet, productWebAddress, nil) // build the outgoing request
 	if err != nil {
-		return oneVisitOutcome{webAddress: webAddress, problem: err} // report the problem if it could not even be built
+		outcome.problem = err // record that the request could not even be built
+		return outcome        // nothing more we can do for this page
 	}
 	request.Header.Set("User-Agent", identifyOurselvesAs) // attach our identifying header
 
-	startTime := time.Now()                // remember when we started, to measure duration
-	response, err := webClient.Do(request) // actually send the request and wait for a response
-	timeTaken := time.Since(startTime)     // work out how long that took
+	startTime := time.Now()                       // remember when we started, to measure duration
+	response, err := webClient.Do(request)        // actually send the request and wait for a response
+	outcome.howLongItTook = time.Since(startTime) // work out how long that took
 
 	if err != nil {
-		return oneVisitOutcome{webAddress: webAddress, howLongItTook: timeTaken, problem: err} // report the problem
+		outcome.problem = err // record the problem
+		return outcome        // nothing more we can do for this page
 	}
 	defer response.Body.Close() // make sure we close the response body when this function ends
 
-	io.Copy(io.Discard, response.Body) // read and throw away the body so the connection can be reused
+	outcome.statusCode = response.StatusCode // remember the status code either way
 
-	// report a successful visit, including the status code the server sent back
-	return oneVisitOutcome{
-		webAddress:    webAddress,          // which page this was
-		statusCode:    response.StatusCode, // the HTTP status code, e.g. 200 or 404
-		howLongItTook: timeTaken,           // how long the request took
+	bodyBytes, err := io.ReadAll(response.Body) // read the whole page into memory
+	if err != nil {
+		outcome.problem = err // record the problem
+		return outcome        // nothing more we can do for this page
 	}
+
+	if response.StatusCode >= 400 {
+		outcome.problem = fmt.Errorf("got status %s", response.Status) // treat error statuses as failures
+		return outcome                                                 // do not look for PDFs on an error page
+	}
+
+	pageText := string(bodyBytes) // convert the page body to text so we can search it
+
+	baseWebAddress, err := url.Parse(productWebAddress) // parse this page's own address, used to resolve relative PDF links
+	if err != nil {
+		outcome.problem = err // record the problem
+		return outcome        // cannot safely resolve PDF links without a valid base address
+	}
+
+	pdfWebAddresses := findPdfWebAddressesOnPage(pageText, baseWebAddress) // find every PDF linked from this page
+	outcome.pdfsFoundOnPage = len(pdfWebAddresses)                         // remember how many we found
+
+	// go through every PDF link found on this page, one at a time
+	for _, onePdfWebAddress := range pdfWebAddresses {
+		wasAlreadySaved, downloadErr := downloadPdfUnlessAlreadySaved(webClient, onePdfWebAddress) // download it, unless we already have it
+		if downloadErr != nil {
+			log.Printf("  Warning: could not download %s: %v", onePdfWebAddress, downloadErr) // log the problem but keep going
+			continue                                                                          // move on to the next PDF
+		}
+		if wasAlreadySaved {
+			outcome.pdfsAlreadySaved++ // count it as already saved
+		} else {
+			outcome.pdfsDownloadedNow++      // count it as newly downloaded
+			time.Sleep(pauseBetweenRequests) // pause briefly, since this was a real download request
+		}
+	}
+
+	return outcome // hand back everything that happened on this page
 }
 
-// printFinalSummary prints how many pages succeeded and lists any failures.
+// downloadPdfUnlessAlreadySaved works out the local file name for a PDF web
+// address, skips it if that file already exists in the PDFs folder, and
+// otherwise downloads it and saves it there. It reports whether the file
+// was already saved (true) or was freshly downloaded (false).
+func downloadPdfUnlessAlreadySaved(webClient *http.Client, pdfWebAddress string) (bool, error) {
+	localFileName := localFileNameForPdfWebAddress(pdfWebAddress) // work out what to call the file on disk
+	if localFileName == "" {
+		return false, fmt.Errorf("could not work out a file name for %s", pdfWebAddress) // give up on this one
+	}
+	localFilePath := filepath.Join(pdfsFolderName, localFileName) // build the full local path, e.g. "PDFs/WH-1000_Install.pdf"
+
+	if _, statErr := os.Stat(localFilePath); statErr == nil {
+		return true, nil // the file is already there, so skip downloading it again
+	}
+
+	request, err := http.NewRequest(http.MethodGet, pdfWebAddress, nil) // build the outgoing request for the PDF
+	if err != nil {
+		return false, err // report the problem if it could not be built
+	}
+	request.Header.Set("User-Agent", identifyOurselvesAs) // attach our identifying header
+
+	response, err := webClient.Do(request) // send the request and wait for a response
+	if err != nil {
+		return false, err // report the problem if the request failed
+	}
+	defer response.Body.Close() // make sure we close the response body when this function ends
+
+	if response.StatusCode >= 400 {
+		io.Copy(io.Discard, response.Body)                                               // drain the body so the connection can be reused
+		return false, fmt.Errorf("got status %s for %s", response.Status, pdfWebAddress) // report the bad status
+	}
+
+	outputFile, err := os.Create(localFilePath) // create the local file to write the PDF into
+	if err != nil {
+		return false, err // report the problem if the file could not be created
+	}
+	defer outputFile.Close() // make sure we close the file when this function ends
+
+	if _, err := io.Copy(outputFile, response.Body); err != nil {
+		return false, err // report the problem if writing the file failed
+	}
+
+	log.Printf("  Downloaded %s", localFilePath) // let the person watching know a new file was saved
+	return false, nil                            // this one was freshly downloaded, not already saved
+}
+
+// localFileNameForPdfWebAddress takes a full PDF web address and returns
+// just the file name at the end of it, e.g. "WH-1000_Install.pdf".
+func localFileNameForPdfWebAddress(pdfWebAddress string) string {
+	parsedWebAddress, err := url.Parse(pdfWebAddress) // parse the address so we can look at just its path
+	if err != nil {
+		return filepath.Base(pdfWebAddress) // fall back to a simple guess if parsing fails
+	}
+	return filepath.Base(parsedWebAddress.Path) // return the last part of the path, ignoring any query string
+}
+
+// printFinalSummary prints how many pages succeeded, how many PDFs were
+// downloaded and skipped, and lists any failures.
 func printFinalSummary(allOutcomes []oneVisitOutcome) {
-	successCount := 0 // how many pages loaded successfully
-	failureCount := 0 // how many pages failed or errored
+	successCount := 0          // how many pages loaded successfully
+	failureCount := 0          // how many pages failed or errored
+	totalPdfsDownloaded := 0   // how many PDFs were freshly downloaded across every page
+	totalPdfsAlreadySaved := 0 // how many PDFs were already on disk across every page
 
 	log.Println("Summary") // log a heading
 	log.Println("-------") // log an underline for the heading
 
 	for _, outcome := range allOutcomes { // loop over every outcome we recorded
+		totalPdfsDownloaded += outcome.pdfsDownloadedNow  // add this page's fresh downloads to the running total
+		totalPdfsAlreadySaved += outcome.pdfsAlreadySaved // add this page's already-saved PDFs to the running total
+
 		if outcome.problem != nil {
 			failureCount++                                                       // count this as a failure
 			log.Printf("  ERROR  %s -> %v", outcome.webAddress, outcome.problem) // describe the error
@@ -302,6 +449,7 @@ func printFinalSummary(allOutcomes []oneVisitOutcome) {
 	if failureCount > 0 {
 		log.Printf("%d page(s) failed or returned an error status — see above.", failureCount) // call out failures if any
 	}
+	log.Printf("%d PDF(s) downloaded this run, %d PDF(s) were already saved from before.", totalPdfsDownloaded, totalPdfsAlreadySaved) // report the PDF totals
 }
 
 // downloadPageText downloads the given web address and returns its body as text.
