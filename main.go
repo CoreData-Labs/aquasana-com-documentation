@@ -35,7 +35,7 @@ const secondsToWaitForEachRequest = 20 * time.Second
 const pauseBetweenRequests = 150 * time.Millisecond
 
 // the identification text we send with every request so the server knows what is asking
-const identifyOurselvesAs = "aquasana-crawler/1.0 (+https://github.com/; contact: you@example.com)"
+const identifyOurselvesAs = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
 // a safety limit on how many extra listing pages we will ask for, in case something goes wrong
 const mostPaginationRequestsAllowed = 50
